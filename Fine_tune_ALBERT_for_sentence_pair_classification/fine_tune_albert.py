@@ -12,6 +12,7 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel, AdamW , get_linear_schedule_with_warmup
 from datasets import load_dataset, load_metric
+from sklearn.metrics import accuracy_score  , classification_report
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -36,19 +37,20 @@ def printm():
     print("Gen RAM Free: " + humanize.naturalsize( psutil.virtual_memory().available ), " | Proc size: " + humanize.naturalsize( process.memory_info().rss))
     if len(GPUs) > 0:
         gpu = GPUs[0]
-        print("GPU RAM Free: {0:.0f}MB | Used: {1:.0f}MB | Util {2:3.0f}% | Total {3:.0f MB".format(gpu.memoryFree, gpu.memoryUsed, gpu.memoryUtil*100, gpu.memoryTotal))
+        print("GPU RAM Free: {0:.0f}MB | Used: {1:.0f}MB | Util {2:3.0f}% | Total {3:.0f} MB".format(gpu.memoryFree, gpu.memoryUsed, gpu.memoryUtil*100, gpu.memoryTotal))
     else:
         print("NO GPU")
         
 printm()
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print("device::",device)
 SEED = 1
 set_seed(SEED)
 
 ############ Parameters 
 
-DATASET_IS_COLIEE2020 = False 
+DATASET = 'coliee2020'# 'mrpc' # coliee2020
 bert_model = "albert-base-v2"  # 'albert-base-v2', 'albert-large-v2', 'albert-xlarge-v2', 'albert-xxlarge-v2', 'bert-base-uncased', ...
 freeze_bert = False  # if True, freeze the encoder weights and only update the classification layer weights
 maxlen = 128  # maximum length of the tokenized input sentence pair : if greater than "maxlen", the input is truncated and else if smaller, the input is padded
@@ -58,8 +60,8 @@ lr = 2e-5  # learning rate
 epochs = 4  # number of training epochs
 
 ############ Loading the dataset
-def load_dataframes(coliee2020=False):
-    if not coliee2020:
+def load_dataframes(dataset='mrpc'):
+    if dataset=='mrpc':
         print(">>> Loading glue / mrpc")
         dataset = load_dataset('glue', 'mrpc')
         split = dataset['train'].train_test_split(test_size=0.1, seed=1)  # split the original training data for validation
@@ -71,7 +73,7 @@ def load_dataframes(coliee2020=False):
         df_train = pd.DataFrame(train)
         df_val = pd.DataFrame(val)
         df_test = pd.DataFrame(test)
-    else:
+    elif dataset=='coliee2020':
         all_data = pd.read_csv('coliee2020_train_as_csv.csv') 
         all_data['new_label'] = np.where(all_data['label']=='Y',1,0)
         del all_data['label'] , all_data['article_number'] , all_data['id']
@@ -80,11 +82,13 @@ def load_dataframes(coliee2020=False):
         df_train.reset_index(drop=True,inplace=True)
         df_val.reset_index(drop=True,inplace=True)
         df_test.reset_index(drop=True,inplace=True)
+    else:
+        raise Exception("Dataset not supported::"+str(dataset))
 
     ##
     return df_train , df_val, df_test 
 
-df_train , df_val, df_test = load_dataframes(coliee2020=DATASET_IS_COLIEE2020)
+df_train , df_val, df_test = load_dataframes(dataset=DATASET)
 
 print("df_train:",df_train.shape)
 print("df_val:",df_val.shape)
@@ -271,12 +275,16 @@ def train_bert(net, criterion, opti, lr, lr_scheduler, train_loader, val_loader,
             best_ep = ep + 1
 
     # Saving the model
-    path_to_model='models/{}_lr_{}_val_loss_{}_ep_{}.pt'.format(bert_model, lr, round(best_loss, 5), best_ep)
+    path_to_model='models/{}_{}_lr_{}_val_loss_{}_ep_{}.pt'.format(DATASET,bert_model, lr, round(best_loss, 5), best_ep)
     torch.save(net_copy.state_dict(), path_to_model)
     print("The model has been saved in {}".format(path_to_model))
 
     del loss
     torch.cuda.empty_cache()
+    
+    # return path to the best model 
+    return path_to_model
+
 
 
 # Creating instances of training and validation set
@@ -305,12 +313,12 @@ num_training_steps = epochs * len(train_loader)  # The total number of training 
 t_total = (len(train_loader) // iters_to_accumulate) * epochs  # Necessary to take into account Gradient accumulation
 lr_scheduler = get_linear_schedule_with_warmup(optimizer=opti, num_warmup_steps=num_warmup_steps, num_training_steps=t_total)
 
-train_bert(net, criterion, opti, lr, lr_scheduler, train_loader, val_loader, epochs, iters_to_accumulate)
+path_to_best_model = train_bert(net, criterion, opti, lr, lr_scheduler, train_loader, val_loader, epochs, iters_to_accumulate)
 
 ######################### Prediction
-print("Creation of the results' folder...")
-if not os.path.exists('results'):
-    os.makedirs('results')
+print("#####################################################################")
+print("######################## TEST ACCURACY ##############################")
+print("####################################################################")
     
 def get_probs_from_logits(logits):
     """
@@ -319,12 +327,12 @@ def get_probs_from_logits(logits):
     probs = torch.sigmoid(logits.unsqueeze(-1))
     return probs.detach().cpu().numpy()
 
-def test_prediction(net, device, dataloader, with_labels=True, result_file="results/output.txt"):
+def test_prediction(net, device, dataloader, with_labels=True):
     """
     Predict the probabilities on a dataset with or without labels and print the result in a file
     """
     net.eval()
-    w = open(result_file, 'w')
+    #w = open(result_file, 'w')
     probs_all = []
 
     with torch.no_grad():
@@ -341,14 +349,11 @@ def test_prediction(net, device, dataloader, with_labels=True, result_file="resu
                 probs = get_probs_from_logits(logits.squeeze(-1)).squeeze(-1)
                 probs_all += probs.tolist()
 
-    w.writelines(str(prob)+'\n' for prob in probs_all)
-    w.close()
+    #w.writelines(str(prob)+'\n' for prob in probs_all)
+    #w.close()
+    return probs_all
 
-path_to_model = '/content/models/albert-base-v2_lr_2e-05_val_loss_0.35007_ep_3.pt'  
-# path_to_model = '/content/models/...'  # You can add here your trained model
-
-path_to_output_file = 'results/output.txt'
-
+###
 print("Reading test data...")
 test_set = CustomDataset(df_test, maxlen, bert_model)
 test_loader = DataLoader(test_set, batch_size=bs, num_workers=5)
@@ -360,11 +365,14 @@ if torch.cuda.device_count() > 1:  # if multiple GPUs
 
 print()
 print("Loading the weights of the model...")
-model.load_state_dict(torch.load(path_to_model))
+model.load_state_dict(torch.load(path_to_best_model))
 model.to(device)
 
 print("Predicting on test data...")
-test_prediction(net=model, device=device, dataloader=test_loader, with_labels=True,  # set the with_labels parameter to False if your want to get predictions on a dataset without labels
-                result_file=path_to_output_file)
+test_probs_list = test_prediction(net=model, device=device, dataloader=test_loader, with_labels=True)
+test_pred = [1 if tt>= 0.5 else 0 for tt in test_probs_list]
+
+test_accuracy = accuracy_score(test_pred,df_test['label'].tolist())
+print("TEST accuracy:::", test_accuracy)
 print()
-print("Predictions are available in : {}".format(path_to_output_file))
+print(classification_report(test_pred,df_test['label'].tolist()))
